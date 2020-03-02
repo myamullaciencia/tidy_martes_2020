@@ -1,0 +1,210 @@
+---
+title: "tidy_tuesday_hotel_bookings"
+author: "Mallesham Yamulla"
+date: "02/03/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(data.table)
+library(skimr)
+library(naniar)
+library(ggthemes)
+theme_set(theme_fivethirtyeight())
+```
+
+### Data Preparation 
+
+```{r}
+dt_hoteles = fread('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-02-11/hotels.csv')
+```
+
+```{r}
+skim(dt_hoteles)
+```
+
+```{r}
+dt_hoteles[,.N,by=is_canceled]
+```
+
+```{r}
+dt_hotel_stays = dt_hoteles[is_canceled==0,
+                            ][,`:=`(childrens=fifelse(children+babies>0,"children","none"),required_car_parking=fifelse(required_car_parking_spaces>0,"parking","none"))
+                              ][,!c("is_canceled", "reservation_status","babies","required_car_parking_spaces","children")
+                                ]
+```
+
+
+```{r}
+skim(dt_hotel_stays)
+```
+
+```{r}
+dt_hotel_eda_1 =dt_hotel_stays[,`:=`(arrival_date_month=factor(arrival_date_month,levels = month.name))
+                               ][,.(grand_total=.N),by=.(hotel,arrival_date_month,childrens)
+                                 ][,{proportion=round(grand_total/sum(grand_total),2);list(arrival_date_month,proportion)},by=.(hotel,childrens)
+                                   ] 
+```
+
+### EDA 
+
+```{r}
+# VIS 1 
+ggplot(dt_hotel_eda_1,aes(arrival_date_month, proportion, fill = childrens)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  facet_wrap(~hotel, nrow = 2) +
+  labs(
+    x = NULL,
+    y = "Proportion of hotel stays",
+    fill = NULL
+  ) 
+```
+
+```{r}
+dt_hotel_eda_2 = dt_hotel_stays[,.(grand_total=.N),by=.(hotel,required_car_parking,childrens)
+                                ][,{proportion=round(grand_total/sum(grand_total),2);list(required_car_parking,proportion)},by=.(hotel,childrens)
+                                  ]
+```
+
+```{r}
+ggplot(dt_hotel_eda_2,aes(required_car_parking,proportion,fill=childrens)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels=scales::percent_format()) +
+  facet_wrap(~hotel)
+```
+```{r}
+hotel_cols_sel <- c("childrens", "hotel", "arrival_date_month", "meal", "adr", "adults","required_car_parking", "total_of_special_requests","stays_in_week_nights", "stays_in_weekend_nights")
+```
+
+```{r}
+dt_hotel_stays_tidy = dt_hotel_stays[,..hotel_cols_sel
+                                     ][,`:=`(childrens=as.factor(childrens),hotel=as.factor(hotel),required_car_parking=as.factor(required_car_parking),meal=as.factor(meal))
+                                       ]
+```
+
+```{r}
+dt_hotel_stays_tidy
+```
+
+### Modelling 
+
+
+
+```{r}
+# Split specification
+hotel_split <- initial_split(dt_hotel_stays_tidy,prop = .7)
+```
+
+
+```{r}
+# training and testing dts
+dt_hotel_train = training(hotel_split)
+dt_hotel_test = testing(hotel_split)
+```
+
+```{r}
+dt_hotel_train
+```
+
+```{r}
+tidy_model_hotel_recipe <- recipe(childrens ~., data =dt_hotel_train) %>%
+  step_downsample(childrens) %>%
+  step_dummy(all_nominal(),-all_outcomes()) %>%
+  step_zv(all_numeric()) %>%
+  step_normalize(all_numeric()) %>%
+  prep()
+  
+```
+
+```{r}
+dt_hotel_testing_proc = bake(tidy_model_hotel_recipe,new_data = dt_hotel_test)
+```
+
+```{r}
+# Tidy model specificatin
+hotel_tidy_model_knn <- nearest_neighbor() %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+```
+
+```{r}
+# KNN model fitting 
+tidy_model_hotel_fit <- hotel_tidy_model_knn %>%
+  fit(childrens ~ . , data=juice(tidy_model_hotel_recipe))
+```
+
+```{r}
+# Tidy model specificatin
+hotel_tidy_model_dtree <- decision_tree() %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+```
+
+```{r}
+# Decision tree model fit 
+tidy_model_hotel_dtree_fit <- hotel_tidy_model_dtree %>%
+  fit(childrens ~ . , data=juice(tidy_model_hotel_recipe))
+```
+
+```{r}
+tidy_model_hotel_dtree_fit
+```
+
+```{r}
+set.seed(1234)
+validation_splits <- mc_cv(juice(tidy_model_hotel_recipe), prop = 0.9, strata = childrens)
+validation_splits
+```
+
+```{r}
+knn_res <- fit_resamples(
+  childrens ~ .,
+  hotel_tidy_model_knn,
+  validation_splits,
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+```{r}
+tree_res <- fit_resamples(
+  childrens ~ .,
+  hotel_tidy_model_dtree,
+  validation_splits,
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+```{r}
+knn_res %>%
+  collect_metrics()
+```
+
+```{r}
+tree_res %>%
+  collect_metrics()
+```
+```{r}
+knn_res %>%
+  unnest(.predictions) %>%
+  mutate(model = "kknn") %>%
+  bind_rows(tree_res %>%
+    unnest(.predictions) %>%
+    mutate(model = "rpart")) %>%
+  group_by(model) %>%
+  roc_curve(childrens, .pred_children) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = model)) +
+  geom_line(size = 1.5) +
+  geom_abline(
+    lty = 2, alpha = 0.5,
+    color = "gray50",
+    size = 1.2
+  ) + theme_excel_new()
+```
+
